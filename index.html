@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Adherent Searcher</title>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 30px; background: #f9f9f9; }
+        h1 { color: #333; }
+        .container { max-width: 800px; margin: auto; background: #fff; padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px #0001; }
+        label { display: block; margin-top: 16px; font-weight: bold; }
+        input[type="file"], input[type="text"] { margin-top: 8px; }
+        button { margin-top: 16px; padding: 8px 16px; border: none; background: #007bff; color: #fff; border-radius: 4px; cursor: pointer; }
+        button:disabled { background: #aaa; }
+        table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background: #f0f0f0; }
+        tr:nth-child(even) { background: #f9f9f9; }
+        .search-row { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Adherent Searcher</h1>
+    <label for="excelFile">Upload Excel File (Candidates Data):</label>
+    <input type="file" id="excelFile" accept=".xlsx,.xls" />
+
+    <div class="search-row">
+        <input type="text" id="singleSearch" placeholder="Search adherent (e.g. ma 123 p)" />
+        <button id="searchBtn" disabled>Search</button>
+    </div>
+
+    <label for="txtFile">Upload TXT File (Adherent Numbers):</label>
+    <input type="file" id="txtFile" accept=".txt" />
+    <button id="processTxtBtn" disabled>Process TXT</button>
+
+    <button id="exportBtn" disabled>Export Results to Excel</button>
+
+    <div id="sheetjsNote" style="margin-top:10px; color:#b00; font-size:14px; display:none;"></div>
+
+    <div id="fieldSelection" style="display:none; margin-top:20px;"></div>
+    <div id="results"></div>
+</div>
+<script>
+let excelData = [];
+let excelHeaders = [];
+let adherentCol = null;
+let resultsData = [];
+let selectedFields = [];
+let manualEntries = {}; // {rowIdx_colIdx: value}
+
+// Helper: Normalize adherent string (remove spaces, lowercase)
+function normalizeAdherent(str) {
+    return str.replace(/\s+/g, '').toLowerCase();
+}
+
+function isNumeric(val) {
+    return !isNaN(val) && val !== '' && val !== null;
+}
+
+function renderFieldSelection() {
+    const fieldDiv = document.getElementById('fieldSelection');
+    fieldDiv.innerHTML = '<label>Select fields to include in results/export:</label>' +
+        excelHeaders.map((h, i) => `<label style='font-weight:normal;'><input type='checkbox' class='field-checkbox' value='${i}' checked> ${h}</label>`).join(' ');
+    fieldDiv.style.display = 'block';
+    // Update selectedFields
+    selectedFields = excelHeaders.map((_, i) => i);
+    fieldDiv.querySelectorAll('.field-checkbox').forEach(cb => {
+        cb.addEventListener('change', function() {
+            selectedFields = Array.from(fieldDiv.querySelectorAll('.field-checkbox:checked')).map(x => parseInt(x.value));
+            renderResultsTable(resultsData);
+        });
+    });
+}
+
+function renderResultsTable(data) {
+    if (!data || !data.length) { resultsDiv.innerHTML = ''; return; }
+    let html = '<table><thead><tr><th>#</th>';
+    selectedFields.forEach(idx => html += `<th>${excelHeaders[idx]}</th>`);
+    html += '</tr></thead><tbody>';
+    data.forEach((row, rowIdx) => {
+        html += `<tr><td>${rowIdx + 1}</td>`;
+        selectedFields.forEach(colIdx => {
+            let cell = row[colIdx];
+            let key = `${rowIdx}_${colIdx}`;
+            let isManual = manualEntries[key] !== undefined;
+            if ((cell === '' || cell === undefined || cell === null)) {
+                html += `<td><span style='font-weight:bold; color:#888;'>manual</span></td>`;
+            } else {
+                html += `<td${isManual ? " style='font-weight:bold;'" : ''}>${isManual ? manualEntries[key] : (cell ?? '')}</td>`;
+            }
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table>';
+    resultsDiv.innerHTML = html;
+    // No manual input for now, just display 'manual' in empty cells
+}
+
+// Read Excel file
+const excelFileInput = document.getElementById('excelFile');
+const searchBtn = document.getElementById('searchBtn');
+const singleSearch = document.getElementById('singleSearch');
+const txtFileInput = document.getElementById('txtFile');
+const processTxtBtn = document.getElementById('processTxtBtn');
+const exportBtn = document.getElementById('exportBtn');
+const resultsDiv = document.getElementById('results');
+
+excelFileInput.addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+        const data = new Uint8Array(evt.target.result);
+        const workbook = XLSX.read(data, {type: 'array'});
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const json = XLSX.utils.sheet_to_json(worksheet, {header: 1});
+        if (json.length < 2) {
+            alert('Excel file must have headers and at least one row.');
+            return;
+        }
+        // Automatically detect the header row (search for a row containing 'adherent')
+        let headerRowIdx = json.findIndex(row =>
+            row.some(cell =>
+                cell && cell.toString().replace(/\s+/g, '').replace(/\u00A0/g, '').replace(/[^\x20-\x7E]/g, '').toLowerCase().includes('adherent')
+            )
+        );
+        if (headerRowIdx === -1) {
+            alert('No header row containing "adherent" found.\nDetected rows: ' + json.slice(0,5).map(r => JSON.stringify(r)).join('\n'));
+            return;
+        }
+        excelHeaders = json[headerRowIdx];
+        excelData = json.slice(headerRowIdx + 1).filter(row => row.some(cell => cell !== undefined && cell !== null && cell.toString().trim() !== ''));
+        // Find adherent column (very robust: remove all spaces, invisible chars, match if contains 'adherent')
+        adherentCol = excelHeaders.findIndex(h => {
+            if (!h) return false;
+            let cleaned = h.toString()
+                .replace(/\s+/g, '') // remove all spaces
+                .replace(/\u00A0/g, '') // remove non-breaking spaces
+                .replace(/[^\x20-\x7E]/g, '') // remove non-printable chars
+                .toLowerCase();
+            return cleaned.includes('adherent');
+        });
+        if (adherentCol === -1) {
+            alert('No column with "adherent" found in headers.\nDetected headers: ' + excelHeaders.map(h => `"${h}"`).join(', '));
+            return;
+        }
+        searchBtn.disabled = false;
+        processTxtBtn.disabled = false;
+        resultsDiv.innerHTML = '<p style="color:green">Excel loaded. You can now search or process TXT.</p>';
+        renderFieldSelection();
+    };
+    reader.readAsArrayBuffer(file);
+});
+
+// Single adherent search
+searchBtn.addEventListener('click', function() {
+    const query = singleSearch.value.trim();
+    if (!query) return;
+    if (!excelData.length) {
+        alert('Please upload an Excel file first.');
+        return;
+    }
+    const normQuery = normalizeAdherent(query);
+    const found = excelData.find(row => normalizeAdherent(row[adherentCol] ? row[adherentCol].toString() : '') === normQuery);
+    let html = '<table><thead><tr>';
+    excelHeaders.forEach(h => html += `<th>${h}</th>`);
+    html += '</tr></thead><tbody>';
+    if (found) {
+        html += '<tr>' + found.map(cell => `<td>${cell ?? ''}</td>`).join('') + '</tr>';
+    } else {
+        html += '<tr><td colspan="' + excelHeaders.length + '" style="color:red">Not found</td></tr>';
+    }
+    html += '</tbody></table>';
+    resultsDiv.innerHTML = html;
+    resultsData = found ? [found] : [];
+    exportBtn.disabled = !found;
+    renderResultsTable(resultsData);
+    if (resultsData.length) showSheetJSNote();
+});
+
+// TXT file processing
+processTxtBtn.addEventListener('click', function() {
+    const file = txtFileInput.files[0];
+    if (!file) return;
+    if (!excelData.length) {
+        alert('Please upload an Excel file first.');
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+        const lines = evt.target.result.split(/\r?\n/).filter(l => l.trim().length > 0);
+        // Parse lines: support "-1 ma839 p" or just "ma839 p"
+        let parsed = lines.map(line => {
+            let match = line.match(/^\s*-?(\d+)?\s*([\w\s]+)$/i);
+            if (match) {
+                return {
+                    number: match[1] ? parseInt(match[1]) : null,
+                    adherent: match[2].trim()
+                };
+            } else {
+                return { number: null, adherent: line.trim() };
+            }
+        });
+        // If any have numbers, use them as row numbers; else, just use order
+        let numbered = parsed.some(p => p.number !== null);
+        let resultsArr = [];
+        let rowMap = {}; // Map from normalized adherent to row
+        excelData.forEach(row => {
+            let norm = normalizeAdherent(row[adherentCol] ? row[adherentCol].toString() : '');
+            rowMap[norm] = row;
+        });
+        if (numbered) {
+            // Find max number
+            let maxNum = Math.max(...parsed.map(p => p.number || 0));
+            resultsArr = Array(maxNum).fill(null);
+            parsed.forEach(p => {
+                if (p.number) {
+                    let norm = normalizeAdherent(p.adherent);
+                    resultsArr[p.number - 1] = rowMap[norm] || null;
+                }
+            });
+        } else {
+            resultsArr = parsed.map(p => {
+                let norm = normalizeAdherent(p.adherent);
+                return rowMap[norm] || null;
+            });
+        }
+        // Display table
+        let html = '<table><thead><tr><th>#</th>';
+        excelHeaders.forEach(h => html += `<th>${h}</th>`);
+        html += '</tr></thead><tbody>';
+        resultsArr.forEach((row, idx) => {
+            html += `<tr><td>${idx + 1}</td>`;
+            if (row) {
+                html += row.map(cell => `<td>${cell ?? ''}</td>`).join('');
+            } else {
+                html += `<td colspan="${excelHeaders.length}" style="color:red">Not found</td>`;
+            }
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        resultsDiv.innerHTML = html;
+        // For export, build array of arrays (with headers)
+        resultsData = resultsArr.map(row => row ? row : Array(excelHeaders.length).fill(''));
+        exportBtn.disabled = false;
+        renderResultsTable(resultsData);
+        showSheetJSNote();
+    };
+    reader.readAsText(file);
+});
+
+// Export results to Excel
+exportBtn.addEventListener('click', function() {
+    if (!resultsData.length) return;
+    let exportArr = resultsData.map((row, idx) => [idx + 1, ...selectedFields.map(colIdx => {
+        let key = `${idx}_${colIdx}`;
+        if (manualEntries[key] !== undefined) {
+            return {v: manualEntries[key], s: {font: {bold: true, sz: 20}}};
+        } else if (row[colIdx] === '' || row[colIdx] === undefined || row[colIdx] === null) {
+            return {v: 'manual', s: {font: {bold: true, sz: 20, color: 'FFFFFF'}, fill: {fgColor: {rgb: 'FF0000'}}}};
+        } else {
+            return row[colIdx];
+        }
+    })]);
+    let headers = ['#', ...selectedFields.map(idx => excelHeaders[idx])];
+    let ws = XLSX.utils.aoa_to_sheet([headers, ...exportArr]);
+    let wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Results');
+    XLSX.writeFile(wb, 'adherent_results.xlsx');
+});
+
+// After enabling exportBtn, show the note
+function showSheetJSNote() {
+    document.getElementById('sheetjsNote').style.display = 'block';
+    document.getElementById('sheetjsNote').innerHTML =
+        'Note: Cell background and font colors in Excel export are <b>not supported</b> in the free version of SheetJS. Only bold and font size are applied. For full styling, use <a href="https://sheetjs.com/pro/" target="_blank">SheetJS Pro</a> or a backend solution.';
+}
+</script>
+</body>
+</html> 
